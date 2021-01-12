@@ -1,0 +1,186 @@
+
+Description: >
+    Celestine Ekoh-Ordan - Udacity Cloud DevOps Nanodegree project 2
+    CloudFormation stack for the servers of a high availability web app
+
+Parameters:
+    EnvironmentName:
+        Description: An environment name that will be prefixed to resource names
+        Type: String
+
+    S3Bucket:
+        Description: S3 Bucket name for our private bucket containing source code
+        Type: String
+
+Resources:
+
+    LoadBalancerSecGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupName: LBSecGroup
+            GroupDescription: Allow inbound/outbound http to our Load balancer
+            VpcId:
+                Fn::ImportValue:
+                    !Sub ${EnvironmentName}-VPCID
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+            SecurityGroupEgress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+            Tags:
+            - Key: Name
+              Value: !Sub ${EnvironmentName} lb security group
+
+    WebServerSecGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupName: WebServerSecGroup
+            GroupDescription: Allow http to our web host
+            VpcId:
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+                - IpProtocol: tcp
+                  FromPort: 22
+                  ToPort: 22
+                  CidrIp: 0.0.0.0/0
+            SecurityGroupEgress:
+                - IpProtocol: tcp
+                  FromPort: 0
+                  ToPort: 65535
+                  CidrIp: 0.0.0.0/0
+            Tags:
+            - Key: Name
+              Value: !Sub ${EnvironmentName} Web server security group
+
+    UdagramS3ReadOnlyEC2:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                        Service:
+                        - ec2.amazonaws.com
+                      Action:
+                        - 'sts:AssumeRole'
+            Description: This role can only read from our S3 bucket
+            Policies:
+                - PolicyName: AmazonS3ReadOnlyAccess
+                  PolicyDocument:
+                    Version: 2012-10-17
+                    Statement:
+                        - Effect: Allow
+                          Action: 's3:Get*'
+                          Resource: '*'
+            RoleName: UdagramS3ReadOnlyEC2Role
+            Tags:
+            - Key: Name
+              Value: !Sub ${EnvironmentName} udagram S3 readonly role
+
+    ProfileWithRolesForOurApp:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Roles:
+              - !Ref UdagramS3ReadOnlyEC2
+
+    WebAppLaunchConfig:
+        Type: AWS::AutoScaling::LaunchConfiguration
+        Properties:
+            LaunchConfigurationName: Udagram-launch-config
+            IamInstanceProfile: !Ref ProfileWithRolesForOurApp
+            ImageId: ami-0ac73f33a1888c64a
+            InstanceType: t3.small
+            SecurityGroups:
+                - Ref: WebServerSecGroup
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/bin/bash
+                    apt-get update -y
+                    apt-get install -y unzip awscli apache2
+                    systemctl start apache2.service
+                    cd /var/www/html
+                    rm -rf index.html
+                    aws s3 cp s3://${S3Bucket}/dist.zip .
+                    unzip -j dist.zip
+            BlockDeviceMappings:
+            - DeviceName: "/dev/sdk"
+              Ebs:
+                VolumeSize: "10"
+
+    WebAppAutoScalingGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            VPCZoneIdentifier:
+            - Fn::ImportValue:
+                !Sub "${EnvironmentName}-PRIV-NETS"
+            LaunchConfigurationName: !Ref WebAppLaunchConfig
+            MinSize: '2'
+            MaxSize: '4'
+            TargetGroupARNs:
+            - Ref: WebAppTargetGroup
+
+    WebAppLB:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            Subnets:
+            - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+            - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+            SecurityGroups:
+            - Ref: LoadBalancerSecGroup
+
+    Listener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+            - Type: forward
+              TargetGroupArn:
+                Ref: WebAppTargetGroup
+            LoadBalancerArn: !Ref WebAppLB
+            Port: '80'
+            Protocol: HTTP
+
+    ALBListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+            Actions:
+            - Type: forward
+              TargetGroupArn: !Ref WebAppTargetGroup
+            Conditions:
+            - Field: path-pattern
+              Values: [/]
+            ListenerArn: !Ref Listener
+            Priority: 1
+
+    WebAppTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            HealthCheckIntervalSeconds: 10
+            HealthCheckPath: /
+            HealthCheckProtocol: HTTP
+            HealthCheckTimeoutSeconds: 8
+            HealthyThresholdCount: 2
+            Port: 80
+            Protocol: HTTP
+            UnhealthyThresholdCount: 5
+            VpcId:
+                Fn::ImportValue:
+                    Fn::Sub: "${EnvironmentName}-VPCID"
+
+Outputs:
+
+    LBUrl:
+        Description: Load Balancer public URL
+        Value: !Sub http://${WebAppLB.DNSName}
+        Export:
+            Name: !Sub ${EnvironmentName}-LBUrl
